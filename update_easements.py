@@ -1,6 +1,8 @@
 import arcpy
 import os
 from pathlib import Path
+
+from arcpy.management import MakeFeatureLayer
 from config import WAKE_PARCELS_URL, DURHAM_PARCELS_URL, FRANKLIN_PARCELS_URL, GRAVITY_MAINS, SEWER_BASINS_URL, APRX
 from arcpy_functions import make_arcpy_query
 
@@ -39,77 +41,94 @@ def copy_fc_to_temp_gdb(fc, temp_gdb, out_name=None):
     return new_path
 
 
-def main():
+def main(copy_data=False):
     aprx = arcpy.mp.ArcGISProject(APRX)
 
     m = aprx.listMaps()[0]
 
-    gravity_mains = m.addDataFromPath(GRAVITY_MAINS)
+    gravity_mains = m.addDataFromPath(GRAVITY_MAINS if copy_data else os.path.join(TEMP_OUT_GDB, "sewer_gravity_mains"))
 
-    wake_parcels = m.addDataFromPath(WAKE_PARCELS_URL)
+    wake_parcels = m.addDataFromPath(WAKE_PARCELS_URL if copy_data else os.path.join(TEMP_OUT_GDB, "wake_property"))
 
-    durham_parcels = m.addDataFromPath(DURHAM_PARCELS_URL)
+    franklin_parcels = m.addDataFromPath(FRANKLIN_PARCELS_URL if copy_data else os.path.join(TEMP_OUT_GDB, "franklin_parcels"))
 
-    franklin_parcels = m.addDataFromPath(FRANKLIN_PARCELS_URL)
+    if copy_data:
 
-    # gravity_mains_fc = copy_fc_to_temp_gdb(gravity_mains, TEMP_OUT_GDB)
+        gravity_mains_fc = copy_fc_to_temp_gdb(gravity_mains, TEMP_OUT_GDB)
 
-    # wake_parcels_fc = copy_fc_to_temp_gdb(wake_parcels, TEMP_OUT_GDB)
+        gravity_mains = arcpy.MakeFeatureLayer_management(gravity_mains_fc)
 
-    durham_parcels_fc = copy_fc_to_temp_gdb(durham_parcels, TEMP_OUT_GDB, "durham_parcels")
+        wake_parcels_fc = copy_fc_to_temp_gdb(wake_parcels, TEMP_OUT_GDB)
+        wake_parcels = arcpy.MakeFeatureLayer_management(wake_parcels_fc)
 
-    # franklin_parcels_fc = copy_fc_to_temp_gdb(franklin_parcels, TEMP_OUT_GDB, "franklin_parcels")
+        # durham_parcels_fc = copy_fc_to_temp_gdb(durham_parcels, TEMP_OUT_GDB, "durham_parcels")
+
+        franklin_parcels_fc = copy_fc_to_temp_gdb(franklin_parcels, TEMP_OUT_GDB, "franklin_parcels")
+        franklin_parcels = arcpy.MakeFeatureLayer_management(franklin_parcels_fc)
 
 
     gravity_mains_filter = arcpy.MakeFeatureLayer_management(gravity_mains, "gravity_mains_filter", where_clause="ACTIVEFLAG = 1 and OWNEDBY = 0")
 
-    gravity_mains_data = make_arcpy_query(gravity_mains_filter)
+    # gravity_mains_data = make_arcpy_query(gravity_mains_filter)
 
-    intersect_mains = []
+    # intersect_mains = []
 
-    count = 0
-    for i in range(500, 100000, 500):
-        i += 1
-        search_string = ", ".join([str(r["OBJECTID"]) for r in gravity_mains_data.values()][count:i])
-        gravity_mains_filter_select = arcpy.MakeFeatureLayer_management(gravity_mains_filter, "gravity_mains_filter_select", where_clause=f"OBJECTID in ({search_string})")
-        arcpy.SelectLayerByLocation_management(gravity_mains_filter_select, select_features=wake_parcels)
-        intersect = [r for r in arcpy.da.SearchCursor(gravity_mains_filter_select, ["OID@"])]
-        if intersect:
-            intersect_string = "', '".join([str(r["OBJECTID"]) for r in intersect])
-            intersect_selection = make_arcpy_query(gravity_mains_filter_select, where=f"OBJECTID in ('{intersect_string}')")
-            for item in intersect_selection.values():
-                intersect_mains.append(item)
+    # count = 0
+    # for i in range(500, 100000, 500):
+    #     i += 1
+    #     search_string = ", ".join([str(r["OBJECTID"]) for r in gravity_mains_data.values()][count:i])
+    #     gravity_mains_filter_select = arcpy.MakeFeatureLayer_management(gravity_mains_filter, "gravity_mains_filter_select", where_clause=f"OBJECTID in ({search_string})")
+    #     arcpy.SelectLayerByLocation_management(gravity_mains_filter_select, select_features=wake_parcels)
+    #     intersect = [r for r in arcpy.da.SearchCursor(gravity_mains_filter_select, ["OID@"])]
+    #     if intersect:
+    #         intersect_string = "', '".join([str(r["OBJECTID"]) for r in intersect])
+    #         intersect_selection = make_arcpy_query(gravity_mains_filter_select, where=f"OBJECTID in ('{intersect_string}')")
+    #         for item in intersect_selection.values():
+    #             intersect_mains.append(item)
 
 
-    with arcpy.da.SearchCursor(gravity_mains_filter, ["OID@", "SHAPE@"]) as scursor:
-        for row in scursor:
-            arcpy.SelectLayerByLocation_management(wake_parcels, select_features=row[1])
-            intersect = [r for r in arcpy.da.SearchCursor(wake_parcels, ["OID@"])]
-            if intersect:
-                intersect_mains.append(row[0])
-            count += 1
-            if count %100 ==0:
-                print(count)
+    # with arcpy.da.SearchCursor(gravity_mains_filter, ["OID@", "SHAPE@"]) as scursor:
+    #     for row in scursor:
+    #         arcpy.SelectLayerByLocation_management(wake_parcels, select_features=row[1])
+    #         intersect = [r for r in arcpy.da.SearchCursor(wake_parcels, ["OID@"])]
+    #         if intersect:
+    #             intersect_mains.append(row[0])
+    #         count += 1
+    #         if count %100 ==0:
+    #             print(count)
 
     wake_parcels_select = arcpy.SelectLayerByLocation_management(wake_parcels, select_features=gravity_mains_filter)
 
-    durham_parcels_select = arcpy.SelectLayerByLocation_management(durham_parcels, select_features=gravity_mains_filter)
 
     franklin_parcels_select = arcpy.SelectLayerByLocation_management(franklin_parcels, select_features=gravity_mains_filter)
 
-    wake_parcels_shapes = make_arcpy_query(wake_parcels_select, fields="SHAPE@")
-    durham_parcels_shapes = make_arcpy_query(durham_parcels_select, fields="SHAPE@")
-    franklin_parcels_shapes = make_arcpy_query(franklin_parcels_select, fields="SHAPE@")
+    wake_parcels_shapes = make_arcpy_query(wake_parcels, fields="SHAPE@")
 
-    all_parcels = wake_parcels_shapes + durham_parcels_shapes + franklin_parcels_shapes
+    franklin_parcels_shapes = make_arcpy_query(franklin_parcels, fields="SHAPE@")
+
+    all_parcels = [list(s.values())[0] for s in wake_parcels_shapes.values()] + [list(s.values())[0] for s in franklin_parcels_shapes.values()]
 
     arcpy.SelectLayerByLocation_management(gravity_mains_filter, select_features=all_parcels)
 
     # arcpy.SelectLayerByLocation_management(gravity_mains_filter, select_features=durham_parcels, selection_type="ADD_TO_SELECTION")
 
     # arcpy.SelectLayerByLocation_management(gravity_mains_filter, select_features=franklin_parcels, selection_type="ADD_TO_SELECTION")
+    clip_fc = os.path.join("memory", "mains_clip")
+    arcpy.Clip_analysis(gravity_mains_filter, wake_parcels, clip_fc)
+    statistics_value_table = arcpy.ValueTable(2)
+    statistics_value_table.addRow("'DIAMETER' 'MEAN'")
+    dissolve_fc = os.path.join("memory", "mains_dissolve")
+    arcpy.Dissolve_management(clip_fc, dissolve_fc, dissolve_field="DIAMETER", statistics_fields=statistics_value_table, multi_part=False)
+    intersection_points = os.path.join("memory", "intersection_points")
+    intersect_value_table = arcpy.ValueTable(2)
+    intersect_value_table.addRow(f"'{dissolve_fc}' ''")
+    intersect_value_table.addRow(f"'{dissolve_fc}' ''")
+    arcpy.Intersect_analysis(intersect_value_table, intersection_points, output_type="POINT")
+    arcpy.DeleteIdentical_management(intersection_points, "SHAPE")
+    split_mains = os.path.join(TEMP_OUT_GDB, "main_split")
+    arcpy.SplitLineAtPoint_management(dissolve_fc, intersection_points, out_feature_class=split_mains)
 
-    arcpy.Clip_analysis(gravity_mains_filter, wake_parcels, os.path.join(TEMP_OUT_GDB, "mains_clip"))
+
 
 
     print("here")
@@ -149,6 +168,6 @@ def main():
 if __name__ == "__main__":
 
     try:
-        main()
+        main(False)
     except Exception as ex:
         raise ex
