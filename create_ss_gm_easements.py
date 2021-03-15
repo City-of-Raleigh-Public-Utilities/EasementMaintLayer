@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from arcpy.management import MakeFeatureLayer
-from config import WAKE_PARCELS_URL, FRANKLIN_PARCELS_URL, GRAVITY_MAINS, SEWER_BASINS_URL, APRX
+from config import WAKE_PARCELS_URL, FRANKLIN_PARCELS_URL, GRAVITY_MAINS, SEWER_BASINS_URL, APRX, CONNECTION_FILE
 from arcpy_functions import make_arcpy_query
 
 arcpy.env.parallelProcessingFactor = "50%"
@@ -48,13 +48,36 @@ def copy_fc_to_temp_gdb(fc, temp_gdb, out_name=None):
                 icursor.insertRow(row)
     return new_path
 
+def insert_new_records(source_fc, target_fc):
+    source_data = make_arcpy_query(source_fc)
+    target_data = make_arcpy_query(target_fc)
+    existing_facids = [r["FACILITYID"] for r in target_data.values()]
+    source_data = [r for r in source_data.values() if r["FACILITYID"] not in existing_facids]
+    edit = arcpy.da.Editor(CONNECTION_FILE)
+   
+    edit.startEditing(False, True)
+    edit.startOperation()
+    with arcpy.da.InsertCursor(target_fc, ["FACILITYID", "EASEMENT_TYPE", "EASEMENT_LENGTH", "SEWER_BASIN", "SHAPE@"]) as insert_cursor:
+        for new_row in source_data:
+            insert_cursor.insertRow([new_row["FACILITYID"], new_row["EASEMENT_TYPE"], new_row["EASEMENT_LENGTH"], new_row["SEWER_BASIN"], new_row["SHAPE@"]], )
+    edit.stopOperation()
+    edit.stopEditing(True)
+    del edit
+    
+    return
+
 
 def main(copy_data=False):
+
+    # split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
+    # existing_easement_fc = os.path.join(CONNECTION_FILE, "RPUD.EasementMaintenanceAreas")
+    # insert_new_records(split_mains_buffer, existing_easement_fc)
+    # return
     aprx = arcpy.mp.ArcGISProject(APRX)
 
     m = aprx.listMaps()[0]
 
-    gravity_mains = m.addDataFromPath(GRAVITY_MAINS if copy_data else os.path.join(TEMP_OUT_GDB, "sewer_gravity_mains"))
+    gravity_mains_fc  = os.path.join(CONNECTION_FILE, "RPUD.ssGravityMain") if copy_data else os.path.join(TEMP_OUT_GDB, "sewer_gravity_mains")
 
     wake_parcels = m.addDataFromPath(WAKE_PARCELS_URL if copy_data else os.path.join(TEMP_OUT_GDB, "wake_property"))
 
@@ -62,9 +85,7 @@ def main(copy_data=False):
 
     if copy_data:
 
-        gravity_mains_fc = copy_fc_to_temp_gdb(gravity_mains, TEMP_OUT_GDB)
-
-        gravity_mains = arcpy.MakeFeatureLayer_management(gravity_mains_fc)
+        gravity_mains_fc = copy_fc_to_temp_gdb(gravity_mains_fc, TEMP_OUT_GDB, "sewer_gravity_mains")
 
         wake_parcels_fc = copy_fc_to_temp_gdb(wake_parcels, TEMP_OUT_GDB)
         wake_parcels = arcpy.MakeFeatureLayer_management(wake_parcels_fc)
@@ -74,7 +95,7 @@ def main(copy_data=False):
         franklin_parcels = arcpy.MakeFeatureLayer_management(franklin_parcels_fc)
 
 
-    gravity_mains_filter = arcpy.MakeFeatureLayer_management(gravity_mains, "gravity_mains_filter", where_clause="ACTIVEFLAG = 1 and OWNEDBY = 0")
+    gravity_mains_filter = arcpy.MakeFeatureLayer_management(gravity_mains_fc, "gravity_mains_filter", where_clause="ACTIVEFLAG = 1 and OWNEDBY = 0")
 
     arcpy.SelectLayerByLocation_management(wake_parcels, select_features=gravity_mains_filter)
 
@@ -123,6 +144,9 @@ def main(copy_data=False):
             facility_id = f"{critical_value}{str(id_counts[critical_value]).zfill(6)}" if row[0] < 15 else f"{critical_value}{str(id_counts[critical_value]).zfill(6)}"
             easement_type = "SSGM-Non-Critical" if row[0] < 15 else "SSGM-Critical"
             easement_length = row[-1].length
+            if easement_length < 10:
+                ucursor.deleteRow()
+                continue
             row[1] = facility_id
             row[2] = easement_type
             row[3] = easement_length
@@ -130,8 +154,10 @@ def main(copy_data=False):
             ucursor.updateRow(row)
             id_counts[critical_value] += 1
     split_mains_buffer = os.path.join("memory", "split_mains_buffer")
-    arcpy.Buffer_analysis(split_mains, split_mains_buffer, 15, "FULL", "ROUND")
-    arcpy.DeleteField_management(split_mains_buffer, ["DIAMETER", "MEAN_DIAMETER", "BUFF_DIST", "ORIG_FID"]) # arcpy.Delete_management(split_mains)
+    split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
+    arcpy.Buffer_analysis(split_mains, split_mains_buffer, 20, "FULL", "ROUND")
+    arcpy.DeleteField_management(split_mains_buffer, ["DIAMETER", "MEAN_DIAMETER", "BUFF_DIST", "ORIG_FID"]) 
+    arcpy.Delete_management(split_mains)
 
     wake_split_mains_buffer_clip = os.path.join("memory", "wake_split_mains_buffer_clip")
     arcpy.SelectLayerByLocation_management(wake_parcels, select_features=split_mains_buffer)
@@ -144,9 +170,13 @@ def main(copy_data=False):
 
     arcpy.Clip_analysis(split_mains_buffer, franklin_parcels, franklin_split_mains_buffer_clip)
 
-    arcpy.Merge_management([wake_split_mains_buffer_clip, franklin_split_mains_buffer_clip], split_mains_buffer) # arcpy.Delete_management(wake_split_mains_buffer) arcpy.Delete_management(franklin_split_mains_buffer)
+    arcpy.Merge_management([wake_split_mains_buffer_clip, franklin_split_mains_buffer_clip], split_mains_buffer) 
 
-    sewer_basins = m.addDataFromPath(SEWER_BASINS_URL)
+    arcpy.Delete_management(wake_split_mains_buffer_clip)
+
+    arcpy.Delete_management(franklin_split_mains_buffer_clip)
+
+    sewer_basins = arcpy.MakeFeatureLayer_management(os.path.join(CONNECTION_FILE, "RPUD.SewerBasins"))
 
     update_counts = {}
     with arcpy.da.SearchCursor(sewer_basins, ["BASINS", "SHAPE@"]) as scursor:
@@ -177,6 +207,7 @@ def main(copy_data=False):
                 if r[1] == max([a[1] for a in areas]):
                     row[0] = r[0][:20]
                     ucursor.updateRow(row)
+    # arcpy.CopyFeatures_management(split_mains_buffer, )
 
     return
 

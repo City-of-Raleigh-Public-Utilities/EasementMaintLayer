@@ -15,7 +15,7 @@ def make_arcpy_query(fc: Union[Path, str, Layer, Table], fields: Union[list, str
     is then added to another ordered dict with k=OID and v=attributes.
     """
     rows = OrderedDict()
-    s_fields = ["OID@"] + list(arcpy.da.SearchCursor(fc, fields).fields)
+    s_fields = ["OID@", "SHAPE@"] + list(arcpy.da.SearchCursor(fc, fields).fields)
     with arcpy.da.SearchCursor(fc, s_fields, where) as scursor:
         for row in scursor:
             this_row = OrderedDict()
