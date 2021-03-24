@@ -10,6 +10,8 @@ from arcpy_functions import make_arcpy_query
 arcpy.env.parallelProcessingFactor = "50%"
 arcpy.env.overwriteOutput = True
 
+PERSIST_OUTPUT = True
+
 TEMP_OUT_GDB = os.path.join(os.path.dirname(__file__), "easements", "easements.gdb")
 ADD_FIELDS = [
         ["FACILITYID", "TEXT", "", 20],
@@ -19,6 +21,59 @@ ADD_FIELDS = [
         ["PIPE_DIAMETER", "DOUBLE"]
     ]
 
+
+TARGETS = [
+
+    {
+        "connection": CONNECTION_FILE, 
+        "input_name": "RPUD.ssGravityMain", 
+        "intermediate_name": "ssGravityMain", 
+        "output_name": "ssGravityMainEasement", 
+        "critical_values": ["SSGMC", "SSGMNC"], 
+        "easement_types": ["SSGM-Critical", "SSGM-Non-Critical"], 
+        "critical_split_value": 15
+    },
+    {
+        "connection": CONNECTION_FILE, 
+        "input_name": "RPUD.ssForceMain", 
+        "intermediate_name": "ssForceMain", 
+        "output_name": "ssForceMainEasment", 
+        "critical_values": ["SSFM"], 
+        "easement_types": ["SSFM"], 
+        "critical_split_value": 0
+    },
+    {
+        "connection": CONNECTION_FILE, 
+        "input_name": "RPUD.wPressureMain", 
+        "intermediate_name": "wPressureMain", 
+        "output_name": "wPressureMainEasement", 
+        "critical_values": ["WM"], 
+        "easement_types": ["Water"], 
+        "critical_split_value": 0
+    }
+]
+    # "ssForceMain": [CONNECTION_FILE, "RPUD.ssForceMain", "ssForceMain", "ssForceMainEasements"]
+
+
+
+class TargetFc:
+    def __init__(self, connection, input_name, intermediate_name, output_name, critical_values, easement_types, critical_split_value):
+        self.connection = connection
+        self.input_name = input_name
+        self.intermediate_name = intermediate_name
+        self.output_name = output_name
+        self.critical_values = critical_values
+        self.easement_types = easement_types
+        self.critical_split_value = critical_split_value
+        self.id_counts = {critical_value: 1 for critical_value in critical_values}
+        self.source_path = os.path.join(connection, input_name)
+
+    def get_facility_id(self, id_counts, diameter):
+        critical_value = self.critical_values[0] if diameter >= self.critical_split_value else self.critical_values[1]
+        return f"{critical_value}{str(id_counts[critical_value]).zfill(6)}"
+
+    def get_easement_type(self, diamter):
+        return self.easement_types[0] if diamter >= self.critical_split_value else self.easement_types[1]
 
 def copy_fc_to_memory(fc_path: str):
     name = os.path.basename(fc_path).split(".")[1]
@@ -42,15 +97,15 @@ def copy_fc_to_temp_gdb(fc, temp_gdb, out_name=None):
             arcpy.conversion.FeatureClassToFeatureClass(fc, temp_gdb, new_name)
         except arcpy.ExecuteError:
             arcpy.CreateFeatureclass_management(temp_gdb, new_name, "POLYGON", fc)
-            fc_data = make_arcpy_query(fc)
+            fc_data = make_arcpy_query(fc)[0]
             icursor = arcpy.InsertCursor(new_path)
             for row in fc_data.values():
                 icursor.insertRow(row)
     return new_path
 
 def insert_new_records(source_fc, target_fc):
-    source_data = make_arcpy_query(source_fc)
-    target_data = make_arcpy_query(target_fc)
+    source_data = make_arcpy_query(source_fc)[0]
+    target_data = make_arcpy_query(target_fc)[0]
     existing_facids = [r["FACILITYID"] for r in target_data.values()]
     source_data = [r for r in source_data.values() if r["FACILITYID"] not in existing_facids]
     edit = arcpy.da.Editor(CONNECTION_FILE)
@@ -101,38 +156,39 @@ def main(copy_data=False):
 
     arcpy.SelectLayerByLocation_management(franklin_parcels, select_features=gravity_mains_filter)
 
-    wake_parcels_shapes = make_arcpy_query(wake_parcels, fields="SHAPE@")
+    wake_parcels_shapes = make_arcpy_query(wake_parcels, fields="SHAPE@")[0]
 
-    franklin_parcels_shapes = make_arcpy_query(franklin_parcels, fields="SHAPE@")
+    franklin_parcels_shapes = make_arcpy_query(franklin_parcels, fields="SHAPE@")[0]
 
     all_parcels = [list(s.values())[0] for s in wake_parcels_shapes.values()] + [list(s.values())[0] for s in franklin_parcels_shapes.values()]
 
     arcpy.SelectLayerByLocation_management(gravity_mains_filter, select_features=all_parcels)
 
-    wake_clip_fc = os.path.join("memory", "wake_mains_clip")
+    wake_clip_fc = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "wake_mains_clip")
     arcpy.Clip_analysis(gravity_mains_filter, wake_parcels, wake_clip_fc)
 
-    franklin_clip_fc = os.path.join("memory", "franklin_mains_clip")
+    franklin_clip_fc = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "franklin_mains_clip")
     arcpy.Clip_analysis(gravity_mains_filter, franklin_parcels, franklin_clip_fc)
 
-    clip_fc = os.path.join("memory", "clip_fc")
+    clip_fc = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "clip_fc")
     arcpy.Merge_management([wake_clip_fc, franklin_clip_fc], clip_fc)
-    arcpy.Delete_management(wake_clip_fc)
-    arcpy.Delete_management(franklin_clip_fc)
+    if not PERSIST_OUTPUT:
+        arcpy.Delete_management(wake_clip_fc)
+        arcpy.Delete_management(franklin_clip_fc)
 
-    statistics_value_table = arcpy.ValueTable(2)
-    statistics_value_table.addRow("'DIAMETER' 'MEAN'")
-    dissolve_fc = os.path.join("memory", "mains_dissolve")
-    arcpy.Dissolve_management(clip_fc, dissolve_fc, dissolve_field="DIAMETER", statistics_fields=statistics_value_table, multi_part=False) # arcpy.Delete_management(clip_fc)
+    # statistics_value_table = arcpy.ValueTable(2)
+    # statistics_value_table.addRow("'DIAMETER' 'MEAN'")
+    dissolve_fc = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "mains_dissolve")
+    arcpy.Dissolve_management(clip_fc, dissolve_fc, dissolve_field="DIAMETER", multi_part=False) # arcpy.Delete_management(clip_fc)
 
-    intersection_points = os.path.join("memory", "intersection_points")
+    intersection_points = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "intersection_points")
     intersect_value_table = arcpy.ValueTable(2)
     intersect_value_table.addRow(f"'{dissolve_fc}' ''")
     intersect_value_table.addRow(f"'{dissolve_fc}' ''")
     arcpy.Intersect_analysis(intersect_value_table, intersection_points, output_type="POINT")
     arcpy.DeleteIdentical_management(intersection_points, "SHAPE")
-    split_mains = os.path.join("memory", "main_split")
-    arcpy.SplitLineAtPoint_management(dissolve_fc, intersection_points, out_feature_class=split_mains) # arcpy.Delete_management(intersection_points)
+    split_mains = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "main_split")
+    arcpy.SplitLineAtPoint_management(dissolve_fc, intersection_points, out_feature_class=split_mains, search_radius=.001) # arcpy.Delete_management(intersection_points)
 
     arcpy.AddFields_management(split_mains, ADD_FIELDS)
 
@@ -153,28 +209,30 @@ def main(copy_data=False):
             row[5] = row[0]
             ucursor.updateRow(row)
             id_counts[critical_value] += 1
-    split_mains_buffer = os.path.join("memory", "split_mains_buffer")
-    split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
+    split_mains_buffer = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "split_mains_buffer")
+    # split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
     arcpy.Buffer_analysis(split_mains, split_mains_buffer, 20, "FULL", "ROUND")
-    arcpy.DeleteField_management(split_mains_buffer, ["DIAMETER", "MEAN_DIAMETER", "BUFF_DIST", "ORIG_FID"]) 
-    arcpy.Delete_management(split_mains)
+    arcpy.DeleteField_management(split_mains_buffer, ["MEAN_DIAMETER", "BUFF_DIST", "ORIG_FID"]) 
+    if not PERSIST_OUTPUT:
+        arcpy.Delete_management(split_mains)
 
-    wake_split_mains_buffer_clip = os.path.join("memory", "wake_split_mains_buffer_clip")
+    wake_split_mains_buffer_clip = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "wake_split_mains_buffer_clip")
     arcpy.SelectLayerByLocation_management(wake_parcels, select_features=split_mains_buffer)
 
     arcpy.Clip_analysis(split_mains_buffer, wake_parcels, wake_split_mains_buffer_clip)
 
-    franklin_split_mains_buffer_clip = os.path.join("memory", "franklin_split_mains_buffer_clip")
+    franklin_split_mains_buffer_clip = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", "franklin_split_mains_buffer_clip")
 
     arcpy.SelectLayerByLocation_management(franklin_parcels, select_features=split_mains_buffer)
 
     arcpy.Clip_analysis(split_mains_buffer, franklin_parcels, franklin_split_mains_buffer_clip)
 
     arcpy.Merge_management([wake_split_mains_buffer_clip, franklin_split_mains_buffer_clip], split_mains_buffer) 
+    
+    if not PERSIST_OUTPUT:
+        arcpy.Delete_management(wake_split_mains_buffer_clip)
 
-    arcpy.Delete_management(wake_split_mains_buffer_clip)
-
-    arcpy.Delete_management(franklin_split_mains_buffer_clip)
+        arcpy.Delete_management(franklin_split_mains_buffer_clip)
 
     sewer_basins = arcpy.MakeFeatureLayer_management(os.path.join(CONNECTION_FILE, "RPUD.SewerBasins"))
 
@@ -195,7 +253,7 @@ def main(copy_data=False):
     with arcpy.da.UpdateCursor(split_mains_buffer, ["SEWER_BASIN", "SHAPE@"], where_clause="SEWER_BASIN is NULL") as ucursor:
         for row in ucursor:
             selected_basins = arcpy.SelectLayerByLocation_management(sewer_basins, overlap_type="INTERSECT", select_features=row[1])
-            selected_basins = make_arcpy_query(sewer_basins,["BASINS", "SHAPE@"])
+            selected_basins = make_arcpy_query(sewer_basins,["BASINS", "SHAPE@"])[0]
             areas = []
             for basin in selected_basins.values():
 
@@ -216,6 +274,7 @@ def main(copy_data=False):
 if __name__ == "__main__":
 
     try:
+        target_fcs = [TargetFc(**target) for target in TARGETS]
         main(False)
     except Exception as ex:
         raise ex
