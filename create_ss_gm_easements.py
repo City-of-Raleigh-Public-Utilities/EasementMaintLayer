@@ -105,18 +105,18 @@ def copy_fc_to_temp_gdb(fc, temp_gdb, out_name=None):
                 icursor.insertRow(row)
     return new_path
 
-def insert_new_records(source_fc, target_fc):
+def insert_new_records(source_fc, target_fc, connection):
     source_data = make_arcpy_query(source_fc)[0]
     target_data = make_arcpy_query(target_fc)[0]
     existing_facids = [r["FACILITYID"] for r in target_data.values()]
     source_data = [r for r in source_data.values() if r["FACILITYID"] not in existing_facids]
-    edit = arcpy.da.Editor(CONNECTION_FILE)
+    edit = arcpy.da.Editor(connection)
    
     edit.startEditing(False, True)
     edit.startOperation()
-    with arcpy.da.InsertCursor(target_fc, ["FACILITYID", "EASEMENT_TYPE", "EASEMENT_LENGTH", "SEWER_BASIN", "SHAPE@"]) as insert_cursor:
+    with arcpy.da.InsertCursor(target_fc, ["FACILITYID", "EASEMENT_TYPE", "EASEMENT_LENGTH", "SEWER_BASIN", "DIAMETER", "SHAPE@"]) as insert_cursor:
         for new_row in source_data:
-            insert_cursor.insertRow([new_row["FACILITYID"], new_row["EASEMENT_TYPE"], new_row["EASEMENT_LENGTH"], new_row["SEWER_BASIN"], new_row["SHAPE@"]], )
+            insert_cursor.insertRow([new_row["FACILITYID"], new_row["EASEMENT_TYPE"], new_row["EASEMENT_LENGTH"], new_row["SEWER_BASIN"], new_row["DIAMETER"], new_row["SHAPE@"]], )
     edit.stopOperation()
     edit.stopEditing(True)
     del edit
@@ -124,12 +124,8 @@ def insert_new_records(source_fc, target_fc):
     return
 
 
-def main(target, m, wake_parcels, franklin_parcels):
+def main(target, m, wake_parcels, franklin_parcels, sewer_basins):
 
-    # split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
-    # existing_easement_fc = os.path.join(CONNECTION_FILE, "RPUD.EasementMaintenanceAreas")
-    # insert_new_records(split_mains_buffer, existing_easement_fc)
-    # return
     mains_fc = copy_fc_to_temp_gdb(target.source_path, TEMP_OUT_GDB, target.intermediate_name)
 
 
@@ -191,7 +187,7 @@ def main(target, m, wake_parcels, franklin_parcels):
             row[5] = row[0]
             ucursor.updateRow(row)
 
-    split_mains_buffer = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", f"{target.output_name}split_mains_buffer")
+    split_mains_buffer = os.path.join(TEMP_OUT_GDB if PERSIST_OUTPUT else "memory", target.output_name)
     # split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
     arcpy.Buffer_analysis(split_mains, split_mains_buffer, 20, "FULL", "ROUND")
     arcpy.DeleteField_management(split_mains_buffer, ["MEAN_DIAMETER", "BUFF_DIST", "ORIG_FID"]) 
@@ -216,9 +212,7 @@ def main(target, m, wake_parcels, franklin_parcels):
 
         arcpy.Delete_management(franklin_split_mains_buffer_clip)
 
-    sewer_basins = arcpy.MakeFeatureLayer_management(os.path.join(CONNECTION_FILE, "RPUD.SewerBasins"))
-
-    if target.input_name != "RPUD.ssGravityMain":
+    if target.input_name != "RPUD.wPressureMain":
 
         update_counts = {}
         with arcpy.da.SearchCursor(sewer_basins, ["BASINS", "SHAPE@"]) as scursor:
@@ -235,7 +229,7 @@ def main(target, m, wake_parcels, franklin_parcels):
                                 update_counts[urow[0]] = 1
 
         with arcpy.da.UpdateCursor(split_mains_buffer, ["SEWER_BASIN", "SHAPE@"], where_clause="SEWER_BASIN is NULL") as ucursor:
-            for row in ucursor:
+            for i, row in enumerate(ucursor):
                 selected_basins = arcpy.SelectLayerByLocation_management(sewer_basins, overlap_type="INTERSECT", select_features=row[1])
                 selected_basins = make_arcpy_query(sewer_basins,["BASINS", "SHAPE@"])[0]
                 areas = []
@@ -249,6 +243,7 @@ def main(target, m, wake_parcels, franklin_parcels):
                     if r[1] == max([a[1] for a in areas]):
                         row[0] = r[0][:20]
                         ucursor.updateRow(row)
+                print(i)
     # arcpy.CopyFeatures_management(split_mains_buffer, )
 
     return
@@ -256,8 +251,19 @@ def main(target, m, wake_parcels, franklin_parcels):
 
 
 if __name__ == "__main__":
+    # TEST_CONNECTION = r"C:\Users\pottera\projects\data_management\EasementMaintLayer\gisttst.sde"
+    # target_FC = os.path.join(TEST_CONNECTION, "RPUD.EasementMaintenanceAreas")
+    # source_fcs = [TargetFc(**source) for source in TARGETS]
+    # for source in source_fcs:
+    #     source_fc = os.path.join(TEMP_OUT_GDB, source.output_name)
+    #     insert_new_records(source_fc, target_FC, TEST_CONNECTION)
 
-    COPY_DATA = True
+    # split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
+    # existing_easement_fc = os.path.join(CONNECTION_FILE, "RPUD.EasementMaintenanceAreas")
+    # insert_new_records(split_mains_buffer, existing_easement_fc)
+    # return
+
+    COPY_DATA = False
 
     try:
         target_fcs = [TargetFc(**target) for target in TARGETS]
@@ -270,15 +276,20 @@ if __name__ == "__main__":
 
         franklin_parcels = m.addDataFromPath(FRANKLIN_PARCELS_URL if COPY_DATA else os.path.join(TEMP_OUT_GDB, "franklin_parcels"))
 
+        sewer_basins_fc =os.path.join(CONNECTION_FILE,"RPUD.SewerBasins") if COPY_DATA else os.path.join(TEMP_OUT_GDB, "SewerBasins")
+
         if COPY_DATA:
 
-            wake_parcels_fc = copy_fc_to_temp_gdb(wake_parcels, TEMP_OUT_GDB)
+            wake_parcels_fc = copy_fc_to_temp_gdb(wake_parcels, TEMP_OUT_GDB, "wake_property")
             wake_parcels = arcpy.MakeFeatureLayer_management(wake_parcels_fc)
 
 
             franklin_parcels_fc = copy_fc_to_temp_gdb(franklin_parcels, TEMP_OUT_GDB, "franklin_parcels")
             franklin_parcels = arcpy.MakeFeatureLayer_management(franklin_parcels_fc)
+
+            sewer_basins_fc = copy_fc_to_temp_gdb(sewer_basins_fc, TEMP_OUT_GDB, "SewerBasins")
+        sewer_basins = arcpy.MakeFeatureLayer_management(sewer_basins_fc)
         for target_fc in target_fcs:
-            main(target_fc, m, wake_parcels, franklin_parcels)
+            main(target_fc, m, wake_parcels, franklin_parcels, sewer_basins)
     except Exception as ex:
         raise ex
