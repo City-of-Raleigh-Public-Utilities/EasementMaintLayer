@@ -1,7 +1,7 @@
 import arcpy
 from db_functions import connect_to_oracle_db
-from config import GISTTRANSAUTH, CONNECTION_FILE, GRAVITY_MAINS, WAKE_PARCELS_URL
-from arcpy_functions import arcpy_to_df
+from config import GISTTRANSAUTH, CONNECTION_FILE, GRAVITY_MAINS, WAKE_PARCELS_URL, APRX, TEST_CONNECTION_FILE
+from arcpy_functions import arcpy_to_df, make_arcpy_query
 import time
 import os
 import pandas as pd
@@ -12,7 +12,18 @@ import datetime
 import arcpy
 import json
 
+TEMP_OUT_GDB = os.path.join(os.path.dirname(__file__), "easements", "easements.gdb")
+arcpy.env.overwriteOutput = True
+aprx = arcpy.mp.ArcGISProject(APRX)
+
+m = aprx.listMaps()[0]
+wake_parcels = m.addDataFromPath(WAKE_PARCELS_URL)
+gravity_mains = m.addDataFromPath(GRAVITY_MAINS)
+easements = os.path.join(TEST_CONNECTION_FILE, "RPUD.EasementMaintenanceAreas")
+
 def main():
+
+    sr = arcpy.SpatialReference(2264)
 
     table_name = "ssGravityMain"
 
@@ -20,26 +31,27 @@ def main():
     timestamp = datetime.datetime.strptime(last_run, "%Y-%m-%d %H:%M:%S.%f").timestamp() * 1000
 
     resp = requests.get(f"{GRAVITY_MAINS}/query", params={"where": f"EDITEDON > TIMESTAMP '{last_run}'AND ACTIVEFLAG = 1 and OWNEDBY = 0", "outFields": "*", "f": "JSON"} )
-    features = [{"feature": feature["attributes"],"geometry":feature["geometry"], "SHAPE@": arcpy.Polyline(arcpy.Array([arcpy.Point(*coords) for coords in feature["geometry"]["paths"][0]]))} for feature in resp.json()["features"]]
+    features = [{"feature": feature["attributes"],"geometry":feature["geometry"], "SHAPE@": arcpy.Polyline(arcpy.Array([arcpy.Point(*coords) for coords in feature["geometry"]["paths"][0]]), sr)} for feature in resp.json()["features"]]
     changed_df = pd.DataFrame([feature["feature"] for feature in features])
     changed_df["geometry"] = [feature["geometry"] for feature in features]
     changed_df["SHAPE@"] = [feature["SHAPE@"] for feature in features]
     prev_geom_df = pd.read_csv(os.path.join(os.path.dirname(__file__), f"{table_name}_length.csv"))
-    changed_mains = changed_df.merge(prev_geom_df, left_on="FACILITYID", right_on="facilityid")
+    changed_mains = changed_df.dropna(subset=["FACILITYID"]).merge(prev_geom_df.dropna(subset=["FACILITYID"]), left_on="FACILITYID", right_on="FACILITYID")
     changed_mains["new_length"] = changed_mains["SHAPE@"].apply(lambda x: x.length)
-    diff_geom = changed_mains[~isclose(changed_mains["new_length"], changed_mains["SDE.ST_LENGTH(SHAPE)"])]
+    diff_geom = changed_mains[~isclose(changed_mains["new_length"], changed_mains["SHAPE_Leng"], atol=5)]
     if diff_geom.empty:
         return
     easement_df = pd.read_csv(os.path.join(os.path.dirname(__file__), f"{table_name}Easement_lookup.csv"))
 
-    easement_df_update = easement_df.merge(changed_mains, left_on="FACILITYID_1", right_on="FACILITYID")
+    easement_df_update = easement_df.merge(diff_geom, left_on="FACILITYID_1", right_on="FACILITYID")
 
     for i, row in easement_df_update.iterrows():
         # make sure to drop dups here
         # print(f"easement_id: {row['FACILITY_ID_x']}")
+        easement_facilityid = row["FACILITYID_x"]
         related_mains = easement_df[easement_df["FACILITYID"] == row["FACILITYID_x"]]
         related_mains_features = requests.get(f"{GRAVITY_MAINS}/query", params={"where": f"""FACILITYID in ('{"', '".join(list(related_mains["FACILITYID_1"].values))}')""", "outFields": "*", "f": "JSON"}).json()
-        related_mains_features = [{"feature": feature["attributes"],"geometry":feature["geometry"], "SHAPE@": arcpy.Polyline(arcpy.Array([arcpy.Point(*coords) for coords in feature["geometry"]["paths"][0]]))} for feature in related_mains_features["features"]]
+        related_mains_features = [{"feature": feature["attributes"],"geometry":feature["geometry"], "SHAPE@": arcpy.Polyline(arcpy.Array([arcpy.Point(*coords) for coords in feature["geometry"]["paths"][0]]), sr)} for feature in related_mains_features["features"]]
         related_mains_df = pd.DataFrame([feature["feature"] for feature in related_mains_features])
         related_mains_df["geometry"] = [feature["geometry"] for feature in related_mains_features]
         related_mains_df["SHAPE@"] = [feature["SHAPE@"] for feature in related_mains_features]
@@ -49,16 +61,49 @@ def main():
         for geom in related_mains_df["geometry"]:
 
             intersecting_parcel = requests.get(f"{WAKE_PARCELS_URL}/query", params={"where": f"1 = 1", "outFields": "*", "geometry":json.dumps(geom), "geometryType":"esriGeometryPolyline", "spatialRel": "esriSpatialRelIntersects","f": "JSON"} ).json()["features"][0]
-            if intersecting_parcel not in intersecting_parcels:
-                intersecting_parcels.append(intersecting_parcel)
+            intersecting_parcels.append(intersecting_parcel)
+            # if intersecting_parcel not in intersecting_parcels:
+            #     intersecting_parcels.append(intersecting_parcel)
             print("here")
         for p in intersecting_parcels:
-            p["SHAPE@"] = arcpy.Polygon(arcpy.Array([arcpy.Point(*coords) for coords in p["geometry"]["rings"][0]]))
-        #TODO: The output of the clip looked right but was in the wrong location. Need to look at spatial ref
-        arcpy.Clip_analysis(list(related_mains_df["SHAPE@"].values), [p["SHAPE@"] for p in intersecting_parcels], os.path.join(os.path.basename(__file__), "mains_clip.shp"))
-        if len(related_mains_df["DIAMETER"].unique()) >1:
-            print("new diameters")
-    print("here")
+            p["SHAPE@"] = arcpy.Polygon(arcpy.Array([arcpy.Point(*coords) for coords in p["geometry"]["rings"][0]]), sr)
+        selected_mains = arcpy.MakeFeatureLayer_management(gravity_mains, where_clause=f"OBJECTID in ({', '.join([str(o) for o in related_mains_df['OBJECTID'].values])})")
+        dissolve_fc = os.path.join(TEMP_OUT_GDB, "mains_dissolve")
+        arcpy.Dissolve_management(selected_mains, dissolve_fc, "DIAMETER", multi_part=False, statistics_fields=[["FACILITYID", "FIRST"]])
+        this_easement = make_arcpy_query(easements, where=f"FACILITYID = '{easement_facilityid}'")[0]
+        this_easement = [v for k,v in this_easement.items()][0]
+        mains_for_analysis = []
+        dissolved_mains = make_arcpy_query(dissolve_fc)[0]
+        for k, v in dissolved_mains.items():
+            intersect = this_easement["SHAPE@"].intersect(v["SHAPE@"], 2)
+            covered = intersect.length/ v["SHAPE@"].length
+            if covered > .25:
+                mains_for_analysis.append(v)
+
+        print(mains_for_analysis)
+
+
+
+        # intersection_points = os.path.join(TEMP_OUT_GDB, "intersection_points")
+        # intersect_value_table = arcpy.ValueTable(2)
+        # intersect_value_table.addRow(f"'{dissolve_fc}' ''")
+        # intersect_value_table.addRow(f"'{dissolve_fc}' ''")
+        # arcpy.Intersect_analysis(intersect_value_table, intersection_points, output_type="POINT")
+        # arcpy.DeleteIdentical_management(intersection_points, "SHAPE")
+        # split_mains = os.path.join(TEMP_OUT_GDB, "main_split")
+        # arcpy.SplitLineAtPoint_management(dissolve_fc, intersection_points, out_feature_class=split_mains, search_radius=.001) # arcpy.Delete_management(intersection_points)
+
+    #     if arcpy.GetCount_management(dissolve_fc) > 1:
+    #         print("This feature is split")
+    #     # arcpy.SelectLayerByAttribute_management(gravity_mains, where_clause=f"OBJECTID in ({', '.join([str(o) for o in related_mains_df['OBJECTID'].values])})")
+    #     arcpy.SelectLayerByAttribute_management(wake_parcels, where_clause=f"OBJECTID in ({', '.join([str(p['attributes']['OBJECTID']) for p in intersecting_parcels])})")
+    #     # arcpy.Clip_analysis(selected_mains, wake_parcels, os.path.join(os.path.dirname(__file__), "mains_clip.shp"))
+    #     #TODO: The output of the clip looked right but was in the wrong location. Need to look at spatial ref
+    #     # arcpy.Dissolve_management(list(related_mains_df["SHAPE@"].values), dissolve_fc, dissolve_field="DIAMETER", multi_part=False)
+    #     # arcpy.Clip_analysis(list(related_mains_df["SHAPE@"].values), [p["SHAPE@"] for p in intersecting_parcels], os.path.join(os.path.dirname(__file__), "mains_clip.shp"))
+    #     if len(related_mains_df["DIAMETER"].unique()) >1:
+    #         print("new diameters")
+    # print("here")
         #***** this intersects with parcels**************
         # resp = requests.get(f"{WAKE_PARCELS_URL}/query", params={"where": f"1 = 1", "outFields": "*", "geometry":json.dumps(row['geometry']), "geometryType":"esriGeometryPolyline", "spatialRel": "esriSpatialRelIntersects","f": "JSON"} )
         # get all child mains here
