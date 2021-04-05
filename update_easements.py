@@ -41,10 +41,11 @@ def main():
     diff_geom = changed_mains[~isclose(changed_mains["new_length"], changed_mains["SHAPE_Leng"], atol=5)]
     if diff_geom.empty:
         return
-    easement_df = pd.read_csv(os.path.join(os.path.dirname(__file__), f"{table_name}Easement_lookup.csv"))
+    easement_df = pd.read_csv(os.path.join(os.path.dirname(__file__), f"{table_name}Easement_lookup_within.csv"))
 
     easement_df_update = easement_df.merge(diff_geom, left_on="FACILITYID_1", right_on="FACILITYID")
 
+    all_mains = arcpy.MakeFeatureLayer_management(gravity_mains)
     for i, row in easement_df_update.iterrows():
         # make sure to drop dups here
         # print(f"easement_id: {row['FACILITY_ID_x']}")
@@ -67,20 +68,36 @@ def main():
             print("here")
         for p in intersecting_parcels:
             p["SHAPE@"] = arcpy.Polygon(arcpy.Array([arcpy.Point(*coords) for coords in p["geometry"]["rings"][0]]), sr)
+
+        clip_fc = os.path.join(TEMP_OUT_GDB, "mains_clip")
         selected_mains = arcpy.MakeFeatureLayer_management(gravity_mains, where_clause=f"OBJECTID in ({', '.join([str(o) for o in related_mains_df['OBJECTID'].values])})")
-        dissolve_fc = os.path.join(TEMP_OUT_GDB, "mains_dissolve")
-        arcpy.Dissolve_management(selected_mains, dissolve_fc, "DIAMETER", multi_part=False, statistics_fields=[["FACILITYID", "FIRST"]])
+        arcpy.Clip_analysis(selected_mains, [p["SHAPE@"] for p in intersecting_parcels], clip_fc)
         this_easement = make_arcpy_query(easements, where=f"FACILITYID = '{easement_facilityid}'")[0]
         this_easement = [v for k,v in this_easement.items()][0]
         mains_for_analysis = []
-        dissolved_mains = make_arcpy_query(dissolve_fc)[0]
-        for k, v in dissolved_mains.items():
-            intersect = this_easement["SHAPE@"].intersect(v["SHAPE@"], 2)
-            covered = intersect.length/ v["SHAPE@"].length
-            if covered > .25:
-                mains_for_analysis.append(v)
+        dissolve_fc = os.path.join(TEMP_OUT_GDB, "mains_dissolve")
+        arcpy.Dissolve_management(clip_fc, dissolve_fc, "DIAMETER", multi_part=False, statistics_fields=[["FACILITYID", "FIRST"]])
+        
 
         print(mains_for_analysis)
+        intersection_points = os.path.join(TEMP_OUT_GDB, "intersection_points")
+        intersect_value_table = arcpy.ValueTable(2)
+        intersect_value_table.addRow(f"'{dissolve_fc}' ''")
+        intersect_value_table.addRow(f"'{all_mains}' ''")
+        arcpy.Intersect_analysis(intersect_value_table, intersection_points, output_type="POINT")
+        arcpy.DeleteIdentical_management(intersection_points, "SHAPE")
+        split_mains = os.path.join(TEMP_OUT_GDB, "main_split")
+        arcpy.SplitLineAtPoint_management(dissolve_fc, intersection_points, out_feature_class=split_mains, search_radius=.001) # arcpy.Delete_management(intersection_points)
+
+        print("here")
+        # split_mains_data = make_arcpy_query(split_mains)[0]
+        # for k, v in split_mains_data.items():
+        #     intersect = this_easement["SHAPE@"].intersect(v["SHAPE@"], 2)
+
+        #     covered = intersect.length/ v["SHAPE@"].length
+        #     print(covered)
+        #     if covered > .25:
+        #         mains_for_analysis.append(v)
 
 
 
