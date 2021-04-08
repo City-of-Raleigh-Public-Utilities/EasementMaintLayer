@@ -11,6 +11,25 @@ import requests
 import datetime
 import arcpy
 import json
+import logging
+import csv
+
+logging.basicConfig(filename='update_easements.log', filemode='a',format='%(asctime)s - %(message)s', level=logging.INFO)
+
+def export_shapes(input_path):
+    output_dir = os.path.dirname(__file__)
+    output_path = os.path.join(output_dir, f"{os.path.basename(input_path)}_length1.csv")
+    output_data = []
+    with arcpy.da.SearchCursor(input_path, ["OID@", "FACILITYID", "SHAPE@"]) as scursor:
+        for row in scursor:
+            output_data.append([row[0], row[1], row[2].length, row[2].partCount])
+    with open(output_path, "w", newline='') as fle:
+        writer = csv.writer(fle)
+        writer.writerow(["OBJECTID", "FACILITYID", "SHAPE_Leng", "Verts"])
+        for row in output_data:
+            writer.writerow(row)
+
+
 
 ADD_FIELDS = [
         ["FACILITYID", "TEXT", "", 20],
@@ -49,7 +68,7 @@ def main():
     diff_geom = changed_mains[~isclose(changed_mains["new_length"], changed_mains["SHAPE_Leng"], atol=5)]
     if diff_geom.empty:
         return
-    easement_df = pd.read_csv(os.path.join(os.path.dirname(__file__), f"{table_name}Easement_lookup_intersect.csv"))
+    easement_df = pd.read_csv(os.path.join(os.path.dirname(__file__), f"{table_name}Easement_lookup_within.csv"))
 
     easement_df_update = easement_df.merge(diff_geom, left_on="FACILITYID_1", right_on="FACILITYID")
     easement_df_update = easement_df_update.drop_duplicates(subset=["FACILITYID_x"])
@@ -60,6 +79,12 @@ def main():
         # make sure to drop dups here
         # print(f"easement_id: {row['FACILITY_ID_x']}")
         easement_facilityid = row["FACILITYID_x"]
+        main_facilityid = row["FACILITYID_1"]
+        main_features =  requests.get(f"{GRAVITY_MAINS}/query", params={"where": f"""FACILITYID = '{main_facilityid}'""", "outFields": "*", "f": "JSON"}).json()
+        main_features = [{"feature": feature["attributes"],"geometry":feature["geometry"], "SHAPE@": arcpy.Polyline(arcpy.Array([arcpy.Point(*coords) for coords in feature["geometry"]["paths"][0]]), sr)} for feature in main_features["features"]]
+        mains_df = pd.DataFrame([feature["feature"] for feature in main_features])
+        mains_df["geometry"] = [feature["geometry"] for feature in main_features]
+        mains_df["SHAPE@"] = [feature["SHAPE@"] for feature in main_features]
         related_mains = easement_df[easement_df["FACILITYID"] == row["FACILITYID_x"]]
         related_mains_features = requests.get(f"{GRAVITY_MAINS}/query", params={"where": f"""FACILITYID in ('{"', '".join(list(related_mains["FACILITYID_1"].values))}')""", "outFields": "*", "f": "JSON"}).json()
         related_mains_features = [{"feature": feature["attributes"],"geometry":feature["geometry"], "SHAPE@": arcpy.Polyline(arcpy.Array([arcpy.Point(*coords) for coords in feature["geometry"]["paths"][0]]), sr)} for feature in related_mains_features["features"]]
@@ -83,7 +108,7 @@ def main():
         clip_fc = os.path.join(TEMP_OUT_GDB, "mains_clip")
         selected_mains = arcpy.MakeFeatureLayer_management(gravity_mains, where_clause=f"OBJECTID in ({', '.join([str(o) for o in related_mains_df['OBJECTID'].values])})")
         arcpy.SelectLayerByLocation_management(wake_parcels, "INTERSECT", selected_mains, search_distance=30)
-        arcpy.SelectLayerByLocation_management(gravity_mains, "INTERSECT", wake_parcels)
+        # arcpy.SelectLayerByLocation_management(gravity_mains, "INTERSECT", wake_parcels)
         arcpy.Clip_analysis(gravity_mains, wake_parcels, clip_fc)
         this_easement = make_arcpy_query(easements, where=f"FACILITYID = '{easement_facilityid}'")[0]
         this_easement = [v for k,v in this_easement.items()][0]
@@ -113,6 +138,8 @@ def main():
             # if covered > .25:
             mains_for_analysis.append([v, covered])
         matching_mains = [m for m in mains_for_analysis if m[1] > 0.5]
+        if not matching_mains:
+            matching_mains = [m for m in mains_for_analysis if m[1] ==  max([m[1] for m in mains_for_analysis])]
         if matching_mains:
             arcpy.AddFields_management(split_mains, ADD_FIELDS)
             split_mains_buffer = os.path.join(TEMP_OUT_GDB, "split_mains_buffer")
@@ -132,12 +159,35 @@ def main():
 
             top_matching = [d for d in split_mains_buffer_data.values() if d["ORIG_FID"] == top_oid][0]
             top_matching_area = round(top_matching["SHAPE@"].area)
+            top_matching_length = [d[0]["SHAPE@"].length for d in mains_for_analysis if d[0]["OBJECTID"] == top_oid][0]
             
             print(f"current area: {round(this_easement['SHAPE@'].area)}. new area: {top_matching_area}")
             if top_matching_area == round(this_easement["SHAPE@"].area):
                 print("areas match") # if the value is exactly the same, we likely do not need to do anything
             else:
                 print("areas dont match")
+                i_fields = ["FACILITYID", "GLOBALID", "SEWER_BASIN", "DIAMETER", "EASEMENT_TYPE", "EASEMENT_LENGTH", "SURFACE_CONDITION", "ACCESSIBILITY_TIER", "HOMEOWNER_MAINTAINED", "SHAPE@"]
+                edit = arcpy.da.Editor(os.path.join(os.path.dirname(__file__),"easements_backup.gdb"))
+                edit.startEditing(False, True)
+                edit.startOperation()
+                with arcpy.da.InsertCursor(os.path.join(os.path.dirname(__file__),"easements_backup.gdb", "EasementMaintenanceAreas"), i_fields) as icursor:
+                    icursor.insertRow([this_easement[field] for field in i_fields])
+                edit.stopOperation()
+                edit.stopEditing(True)
+                del edit
+
+                edit = arcpy.da.Editor(TEST_CONNECTION_FILE)
+                edit.startEditing(False, True)
+                edit.startOperation()
+                with arcpy.da.UpdateCursor(easements, ["SHAPE@", "EASEMENT_LENGTH"], where_clause=f"""OBJECTID = '{this_easement["OBJECTID"]}'""") as ucursor:
+                    for row in ucursor:
+                        row[0], row[1] = top_matching["SHAPE@"], top_matching_length
+                        ucursor.updateRow(row)
+                edit.stopOperation()
+                edit.stopEditing(True)
+                del edit
+                logging.info(f"Updated {this_easement}")
+
         else:
             print("do something else...")
 
@@ -199,6 +249,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # export_shapes(r"C:\Users\pottera\projects\data_management\EasementMaintLayer\easements\easements.gdb\ssGravityMain")
     main()
 
 
